@@ -1,0 +1,125 @@
+name: stack-fluss
+
+services:
+  rustfs:
+    image: ${RUSTFS_IMAGE}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - RUSTFS_ACCESS_KEY=${S3_ACCESS_KEY}
+      - RUSTFS_SECRET_KEY=${S3_SECRET_KEY}
+      - RUSTFS_CONSOLE_ENABLE=true
+    volumes:
+      - rustfs-data:/data
+    command: /data
+
+  rustfs-init:
+    image: minio/mc
+    depends_on:
+      - rustfs
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set rustfs http://rustfs:9000 ${S3_ACCESS_KEY} ${S3_SECRET_KEY}; do
+        echo 'Waiting for RustFS...';
+        sleep 1;
+      done;
+      mc mb --ignore-existing rustfs/fluss;
+      "
+
+  zookeeper:
+    image: zookeeper:3.9.2
+    restart: always
+
+  coordinator-server:
+    image: apache/fluss:${FLUSS_VERSION}
+    command: coordinatorServer
+    depends_on:
+      zookeeper:
+        condition: service_started
+      rustfs-init:
+        condition: service_completed_successfully
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://coordinator-server:9123
+        remote.data.dir: s3://fluss/remote-data
+        s3.endpoint: http://rustfs:9000
+        s3.access-key: ${S3_ACCESS_KEY}
+        s3.secret-key: ${S3_SECRET_KEY}
+        s3.region: us-east-1
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/${S3_ACCESS_KEY}
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
+        datalake.format: paimon
+        datalake.paimon.metastore: filesystem
+        datalake.paimon.warehouse: s3://fluss/paimon
+        datalake.paimon.s3.endpoint: http://rustfs:9000
+        datalake.paimon.s3.access-key: ${S3_ACCESS_KEY}
+        datalake.paimon.s3.secret-key: ${S3_SECRET_KEY}
+        datalake.paimon.s3.path.style.access: true
+    volumes:
+      - ./lib/paimon-s3-${PAIMON_VERSION}.jar:/opt/fluss/plugins/paimon/paimon-s3-${PAIMON_VERSION}.jar
+
+  tablet-server:
+    image: apache/fluss:${FLUSS_VERSION}
+    command: tabletServer
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server:9123
+        data.dir: /tmp/fluss/data
+        remote.data.dir: s3://fluss/remote-data
+        s3.endpoint: http://rustfs:9000
+        s3.access-key: ${S3_ACCESS_KEY}
+        s3.secret-key: ${S3_SECRET_KEY}
+        s3.region: us-east-1
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/${S3_ACCESS_KEY}
+        s3.assumed.role.sts.endpoint: http://rustfs:9000
+        datalake.format: paimon
+        datalake.paimon.metastore: filesystem
+        datalake.paimon.warehouse: s3://fluss/paimon
+        datalake.paimon.s3.endpoint: http://rustfs:9000
+        datalake.paimon.s3.access-key: ${S3_ACCESS_KEY}
+        datalake.paimon.s3.secret-key: ${S3_SECRET_KEY}
+        datalake.paimon.s3.path.style.access: true
+    volumes:
+      - ./lib/paimon-s3-${PAIMON_VERSION}.jar:/opt/fluss/plugins/paimon/paimon-s3-${PAIMON_VERSION}.jar
+
+  jobmanager:
+    image: apache/fluss-quickstart-flink:${FLINK_IMAGE_TAG}
+    ports:
+      - "8083:8081"
+    entrypoint: ["/opt/flink/init_paimon.sh"]
+    command: ["jobmanager"]
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    volumes:
+      - ./smoke:/opt/smoke:ro
+      - ./lib/paimon-s3-${PAIMON_VERSION}.jar:/opt/flink/lib/paimon-s3-${PAIMON_VERSION}.jar
+
+  taskmanager:
+    image: apache/fluss-quickstart-flink:${FLINK_IMAGE_TAG}
+    depends_on:
+      - jobmanager
+    entrypoint: ["/opt/flink/init_paimon.sh"]
+    command: ["taskmanager"]
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 10
+        taskmanager.memory.process.size: 2048m
+        taskmanager.memory.task.off-heap.size: 128m
+    volumes:
+      - ./lib/paimon-s3-${PAIMON_VERSION}.jar:/opt/flink/lib/paimon-s3-${PAIMON_VERSION}.jar
+
+volumes:
+  rustfs-data:
